@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/template"
 	"time"
 	"unsafe"
 )
@@ -341,6 +342,24 @@ func (n *NullFormatter) Format(e Entry) ([]byte, error) {
 	return nil, nil
 }
 
+type RawFormatter struct{}
+
+func DefaultRawFormatter() Formatter {
+	return &RawFormatter{}
+}
+
+func (r *RawFormatter) Format(e Entry) ([]byte, error) {
+	b := &bytes.Buffer{}
+	fds := FieldsSort(e.Fields())
+	format(b, fds)
+	return b.Bytes(), nil
+}
+
+// A text formatter
+// NOTE:a classical bit of overengineering where string+" " or fmt.Sprintf would
+// work, but provides more options to work with in formatting as opposed to appending or
+// formatting by package fmt. If simplicity is your thing, rewrite this as a simpler
+// formatter.
 type TextFormatter struct {
 	Name            string
 	TimestampFormat string
@@ -380,36 +399,53 @@ func (t *TextFormatter) Format(e Entry) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-var SPACE = []byte(" ")
+type TmplBase struct {
+	t    *template.Template
+	k, v string
+}
 
-func spaceBuffered(n int, s string) string {
-	nb := new(bytes.Buffer)
-	sp := func(n int, b *bytes.Buffer) {
-		for i := 0; i <= n; i++ {
-			nb.Write(SPACE)
-		}
+var baseTmpls map[string]*TmplBase = map[string]*TmplBase{
+	"LVL":  &TmplBase{nil, "Lvl", `{{.Lvl}} `},
+	"NAME": &TmplBase{nil, "Name", `{{.Name}} `},
+	"TIME": &TmplBase{nil, "Time", `{{.Time}} `},
+}
+
+func initializeTemplate(t *TmplBase) {
+	var err error
+	tx := template.New("")
+	t.t, err = tx.Parse(t.v)
+	if err != nil {
+		panic(err)
 	}
-	sp(n, nb)
-	nb.WriteString(s)
-	sp(n, nb)
-	return nb.String()
+}
+
+func initializeTemplates() {
+	for _, v := range baseTmpls {
+		initializeTemplate(v)
+	}
+}
+
+func tmplTo(v string, b *bytes.Buffer, t *TmplBase) string {
+	d := map[string]interface{}{t.k: v}
+	t.t.Execute(b, d)
+	return b.String()
 }
 
 func (t *TextFormatter) formatFields(b *bytes.Buffer, e Entry, keys []string, timestampFormat string) {
+	tb := new(bytes.Buffer)
+
 	lvl := e.Level()
 	lvlColor := lvl.Color()
 	lvlText := strings.ToUpper(lvl.String())
-	lvlColor(b, fmt.Sprintf("%-6s", lvlText))
+	lvlColor(b, tmplTo(lvlText, tb, baseTmpls["LVL"]))
+	tb.Reset()
 
-	nb := new(bytes.Buffer)
-	nb.Write(SPACE)
-	nb.WriteString(t.Name)
-	nb.Write(SPACE)
-	black(b, spaceBuffered(1, t.Name))
+	black(b, tmplTo(t.Name, tb, baseTmpls["NAME"]))
+	tb.Reset()
 
 	timestamp := time.Now().Format(timestampFormat)
-	//blue(b, fmt.Sprintf("%-27s", timestamp))
-	blue(b, spaceBuffered(1, timestamp))
+	blue(b, tmplTo(timestamp, tb, baseTmpls["TIME"]))
+	tb.Reset()
 
 	fds := FieldsSort(e.Fields())
 	format(b, fds)
@@ -617,4 +653,6 @@ var Current Logger
 func init() {
 	hasFormatters = make(formatters)
 	SetFormatter("null", DefaultNullFormatter())
+	SetFormatter("raw", DefaultRawFormatter())
+	initializeTemplates()
 }

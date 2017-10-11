@@ -129,6 +129,7 @@ func (l *logger) Fatalln(v ...interface{}) {
 
 func (l *logger) FatalError(v ...interface{}) {
 	e := newEntry(l, mkFields(0, v...)...)
+	e.SetEntryLevel(LFatal)
 	reader, _ := e.Read()
 	io.Copy(os.Stderr, reader)
 	os.Exit(1)
@@ -185,6 +186,8 @@ type Entry interface {
 	Fielder
 	Reader
 	Created() time.Time
+	SetEntryLevel(l Level)
+	EntryLevel() Level
 }
 
 type Fielder interface {
@@ -233,6 +236,7 @@ type Reader interface {
 
 type entry struct {
 	created time.Time
+	level   Level
 	Reader
 	Logger
 	fields []Field
@@ -241,6 +245,7 @@ type entry struct {
 func newEntry(l Logger, f ...Field) Entry {
 	return &entry{
 		created: time.Now(),
+		level:   LUnrecognized,
 		Logger:  l,
 		fields:  f,
 	}
@@ -253,6 +258,17 @@ func (e *entry) Read() (*bytes.Buffer, error) {
 
 func (e *entry) Fields() []Field {
 	return e.fields
+}
+
+func (e *entry) SetEntryLevel(l Level) {
+	e.level = l
+}
+
+func (e *entry) EntryLevel() Level {
+	if e.level != LUnrecognized {
+		return e.level
+	}
+	return e.Level()
 }
 
 func (e *entry) Created() time.Time {
@@ -448,7 +464,7 @@ func tmplTo(v string, b *bytes.Buffer, t *TmplBase) string {
 func (t *TextFormatter) formatFields(b *bytes.Buffer, e Entry, keys []string, timestampFormat string) {
 	tb := new(bytes.Buffer)
 
-	lvl := e.Level()
+	lvl := e.EntryLevel()
 	lvlColor := lvl.Color()
 	lvlText := strings.ToUpper(lvl.String())
 	lvlColor(b, tmplTo(lvlText, tb, baseTmpls["LVL"]))

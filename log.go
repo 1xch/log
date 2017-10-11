@@ -15,6 +15,7 @@ import (
 	"unsafe"
 )
 
+// An interface to methods of the standard library log package.
 type StdLogger interface {
 	Fatal(...interface{})
 	Fatalf(string, ...interface{})
@@ -27,6 +28,12 @@ type StdLogger interface {
 	Println(...interface{})
 }
 
+// An interface to package local logging functionality.
+type ExtraLogger interface {
+	Log(Level, Entry)
+	FatalError(...interface{})
+}
+
 type Mutex interface {
 	Lock()
 	Unlock()
@@ -35,7 +42,7 @@ type Mutex interface {
 type Logger interface {
 	io.Writer
 	StdLogger
-	Log(Level, Entry)
+	ExtraLogger
 	Mutex
 	Level() Level
 	Formatter
@@ -90,9 +97,9 @@ func log(lv Level, e Entry) {
 		fmt.Fprintf(os.Stderr, "log: Failed to write -- %v\n", err)
 	}
 
-	if lv == LFatal {
-		os.Exit(1)
-	}
+	//if lv == LFatal {
+	//	os.Exit(1)
+	//}
 
 	if lv <= LPanic {
 		panic(&e)
@@ -118,6 +125,14 @@ func (l *logger) Fatalln(v ...interface{}) {
 		log(LFatal, newEntry(l, mkFields(0, v...)...))
 		os.Exit(1)
 	}
+}
+
+func (l *logger) FatalError(v ...interface{}) {
+	e := newEntry(l, mkFields(0, v...)...)
+	e.SetEntryLevel(LFatal)
+	reader, _ := e.Read()
+	io.Copy(os.Stderr, reader)
+	os.Exit(1)
 }
 
 func (l *logger) Panic(v ...interface{}) {
@@ -171,6 +186,8 @@ type Entry interface {
 	Fielder
 	Reader
 	Created() time.Time
+	SetEntryLevel(l Level)
+	EntryLevel() Level
 }
 
 type Fielder interface {
@@ -219,6 +236,7 @@ type Reader interface {
 
 type entry struct {
 	created time.Time
+	level   Level
 	Reader
 	Logger
 	fields []Field
@@ -227,6 +245,7 @@ type entry struct {
 func newEntry(l Logger, f ...Field) Entry {
 	return &entry{
 		created: time.Now(),
+		level:   LUnrecognized,
 		Logger:  l,
 		fields:  f,
 	}
@@ -239,6 +258,17 @@ func (e *entry) Read() (*bytes.Buffer, error) {
 
 func (e *entry) Fields() []Field {
 	return e.fields
+}
+
+func (e *entry) SetEntryLevel(l Level) {
+	e.level = l
+}
+
+func (e *entry) EntryLevel() Level {
+	if e.level != LUnrecognized {
+		return e.level
+	}
+	return e.Level()
 }
 
 func (e *entry) Created() time.Time {
@@ -352,14 +382,14 @@ func (r *RawFormatter) Format(e Entry) ([]byte, error) {
 	b := &bytes.Buffer{}
 	fds := FieldsSort(e.Fields())
 	format(b, fds)
+	b.Write([]byte("\n"))
 	return b.Bytes(), nil
 }
 
-// A text formatter
-// NOTE:a classical bit of overengineering where string+" " or fmt.Sprintf would
-// work, but provides more options to work with in formatting as opposed to appending or
-// formatting by package fmt. If simplicity is your thing, rewrite this as a simpler
-// formatter.
+// A text formatter NOTE:a bit of overengineering involving text.template where
+// string+" " or fmt.Sprintf would work, but this provides multiple templating
+// options to work with in formatting as opposed to appending or formatting by
+// package fmt. If simplicity is your thing, rewrite this.
 type TextFormatter struct {
 	Name            string
 	TimestampFormat string
@@ -434,7 +464,7 @@ func tmplTo(v string, b *bytes.Buffer, t *TmplBase) string {
 func (t *TextFormatter) formatFields(b *bytes.Buffer, e Entry, keys []string, timestampFormat string) {
 	tb := new(bytes.Buffer)
 
-	lvl := e.Level()
+	lvl := e.EntryLevel()
 	lvlColor := lvl.Color()
 	lvlText := strings.ToUpper(lvl.String())
 	lvlColor(b, tmplTo(lvlText, tb, baseTmpls["LVL"]))

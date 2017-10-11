@@ -26,8 +26,6 @@ _testmain.go
 Godeps/*
 !Godeps/Godeps.json
 
-warhola/warhola
-stars
 _back
 *.out
 *.old.*

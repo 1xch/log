@@ -387,9 +387,9 @@ func (r *RawFormatter) Format(e Entry) ([]byte, error) {
 }
 
 // A text formatter NOTE:a bit of overengineering involving text.template where
-// string+" " or fmt.Sprintf would work, but provides multiple templating
+// string+" " or fmt.Sprintf would work, but this provides multiple templating
 // options to work with in formatting as opposed to appending or formatting by
-// package fmt. If simplicity is your thing, rewrite this simpler.
+// package fmt. If simplicity is your thing, rewrite this.
 type TextFormatter struct {
 	Name            string
 	TimestampFormat string

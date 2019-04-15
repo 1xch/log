@@ -1,3 +1,3 @@
 # log
 
-A structured logging package for the go programming language.  
+A structured logging package for the Go programming language.  

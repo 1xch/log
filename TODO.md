@@ -1,0 +1,2 @@
+- color test
+- ?separate formatters to plugin system

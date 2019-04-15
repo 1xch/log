@@ -9,13 +9,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"text/template"
 	"time"
-	"unsafe"
+
+	"github.com/mattn/go-isatty"
 )
 
-// An interface to methods of the standard library log package.
+// A interface to package local structured logging.
+type StrLogger interface {
+	Level() Level
+}
+
+// An interface to some methods of the standard library log package.
 type StdLogger interface {
 	Fatal(...interface{})
 	Fatalf(string, ...interface{})
@@ -29,11 +34,15 @@ type StdLogger interface {
 }
 
 // An interface to package local logging functionality.
-type ExtraLogger interface {
-	Log(Level, Entry)
-	FatalError(...interface{})
+type XtrLogger interface {
+	At(Level, ...interface{})
+	Atf(Level, string, ...interface{})
+	AtTo(Level, io.Writer, ...interface{})
+	AtTof(Level, io.Writer, string, ...interface{})
+	Log(Entry)
 }
 
+// Package level mutex to prevent interference with other mutexes.
 type Mutex interface {
 	Lock()
 	Unlock()
@@ -41,12 +50,12 @@ type Mutex interface {
 
 type Logger interface {
 	io.Writer
+	StrLogger
 	StdLogger
-	ExtraLogger
+	XtrLogger
 	Mutex
-	Level() Level
 	Formatter
-	FormatterSwapper
+	FormatterManager
 	Hooks
 }
 
@@ -54,133 +63,241 @@ type logger struct {
 	io.Writer
 	level Level
 	Formatter
+	formatters formatters
 	Hooks
 	sync.Mutex
 }
 
-func New(w io.Writer, l Level, f Formatter) Logger {
-	return &logger{
-		Writer:    w,
-		level:     l,
-		Formatter: f,
-		Hooks:     &hooks{},
+func New(w io.Writer, l Level, tag string) *logger {
+	ret := &logger{
+		Writer:     w,
+		level:      l,
+		formatters: defaultFormatters(tag),
+		Hooks:      newHooks(),
 	}
+	ret.SwapFormatter("null")
+	return ret
 }
 
 func (l *logger) Level() Level {
 	return l.level
 }
 
-func (l *logger) Log(lv Level, e Entry) {
-	log(lv, e)
+func log(e Entry) {
+	fire(PRE, e.EntryLevel(), e)
+	reader := read(e)
+	e.Lock()
+	copy(e, reader)
+	e.Unlock()
+	fire(POST, e.EntryLevel(), e)
 }
 
-func log(lv Level, e Entry) {
-	if err := e.Fire(lv, e); err != nil {
-		e.Lock()
-		fmt.Fprintf(os.Stderr, "log: Failed to fire hook -- %v\n", err)
-		e.Unlock()
-	}
-
+func read(e Entry) *bytes.Buffer {
 	reader, err := e.Read()
 	if err != nil {
+		fmt.Fprintf(os.Stdout, "log: Failed to obtain reader -- %v\n", err)
+	}
+	return reader
+}
+
+func copy(e Entry, r *bytes.Buffer) {
+	_, err := io.Copy(e, r)
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "log: Failed to write -- %v\n", err)
+	}
+}
+
+func fire(at Timing, lv Level, e Entry) {
+	if err := e.Fire(at, lv, e); err != nil {
 		e.Lock()
-		fmt.Fprintf(os.Stderr, "log: Failed to obtain reader -- %v\n", err)
+		fmt.Fprintf(os.Stdout, "log: Failed to fire hook -- %v\n", err)
 		e.Unlock()
 	}
-
-	e.Lock()
-	defer e.Unlock()
-
-	_, err = io.Copy(e, reader)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "log: Failed to write -- %v\n", err)
-	}
-
-	//if lv == LFatal {
-	//	os.Exit(1)
-	//}
-
-	if lv <= LPanic {
-		panic(&e)
-	}
 }
 
+//
 func (l *logger) Fatal(v ...interface{}) {
 	if l.level >= LFatal {
-		log(LFatal, newEntry(l, mkFields(0, v...)...))
-		os.Exit(1)
+		log(newEntry(l, LFatal, mkFields(0, v...)...))
 	}
 }
 
+//
 func (l *logger) Fatalf(format string, v ...interface{}) {
 	if l.level >= LFatal {
-		log(LFatal, newEntry(l, mkFormatFields(format, v...)...))
-		os.Exit(1)
+		log(newEntry(l, LFatal, mkFormatFields(format, v...)...))
 	}
 }
 
+//
 func (l *logger) Fatalln(v ...interface{}) {
 	if l.level >= LFatal {
-		log(LFatal, newEntry(l, mkFields(0, v...)...))
-		os.Exit(1)
+		log(newEntry(l, LFatal, mkFields(0, v...)...))
 	}
 }
 
-func (l *logger) FatalError(v ...interface{}) {
-	e := newEntry(l, mkFields(0, v...)...)
-	e.SetEntryLevel(LFatal)
-	reader, _ := e.Read()
-	io.Copy(os.Stderr, reader)
-	os.Exit(1)
-}
-
+//
 func (l *logger) Panic(v ...interface{}) {
 	if l.level >= LPanic {
-		log(LPanic, newEntry(l, mkFields(0, v...)...))
+		log(newEntry(l, LPanic, mkFields(0, v...)...))
 	}
-	panic(fmt.Sprint(v...))
 }
 
+//
 func (l *logger) Panicf(format string, v ...interface{}) {
 	if l.level >= LPanic {
-		log(LPanic, newEntry(l, mkFormatFields(format, v...)...))
+		log(newEntry(l, LPanic, mkFormatFields(format, v...)...))
 	}
-	panic(fmt.Sprintf(format, v...))
 }
 
+//
 func (l *logger) Panicln(v ...interface{}) {
 	l.Panic(v...)
 }
 
+//
 func (l *logger) Print(v ...interface{}) {
 	if l.level >= LError {
-		log(LInfo, newEntry(l, mkFields(0, v...)...))
+		log(newEntry(l, LInfo, mkFields(0, v...)...))
 	}
 }
 
+//
 func (l *logger) Printf(format string, v ...interface{}) {
 	if l.level >= LError {
-		log(LInfo, newEntry(l, mkFormatFields(format, v...)...))
+		log(newEntry(l, LInfo, mkFormatFields(format, v...)...))
 	}
 }
 
+//
 func (l *logger) Println(v ...interface{}) {
 	if l.level >= LError {
-		log(LInfo, newEntry(l, mkFields(0, v...)...))
+		log(newEntry(l, LInfo, mkFields(0, v...)...))
 	}
 }
 
-func (l *logger) SwapFormatter(f Formatter) {
-	if f != nil {
-		l.Lock()
-		l.Formatter = f
-		l.Unlock()
-		return
-	}
-	l.Fatalf("Formatter must not be nil.")
+//
+func (l *logger) At(lv Level, v ...interface{}) {
+	log(newEntry(l, lv, mkFields(0, v...)...))
 }
 
+//
+func (l *logger) Atf(lv Level, m string, v ...interface{}) {
+	log(newEntry(l, lv, mkFormatFields(m, v...)...))
+}
+
+//
+func (l *logger) AtTo(lv Level, to io.Writer, v ...interface{}) {
+	e := newEntry(l, lv, mkFields(0, v...)...)
+	fire(PRE, lv, e)
+	reader, _ := e.Read()
+	io.Copy(to, reader)
+	fire(POST, lv, e)
+}
+
+//
+func (l *logger) AtTof(lv Level, to io.Writer, m string, v ...interface{}) {
+	e := newEntry(l, lv, mkFormatFields(m, v...)...)
+	fire(PRE, lv, e)
+	reader, _ := e.Read()
+	io.Copy(to, reader)
+	fire(POST, lv, e)
+}
+
+//
+func (l *logger) Log(e Entry) {
+	log(e)
+}
+
+//
+func (l *logger) SetFormatter(k string, f Formatter) {
+	l.formatters[k] = f
+}
+
+//
+func (l *logger) GetFormatter(k string) Formatter {
+	if f, ok := l.formatters[k]; ok {
+		return f
+	}
+	return &NullFormatter{}
+}
+
+//
+func (l *logger) SwapFormatter(f string) {
+	nf := l.GetFormatter(f)
+	l.Lock()
+	l.Formatter = nf
+	l.Unlock()
+}
+
+//
+type Hook interface {
+	Fire(Entry) error
+}
+
+//
+type HookFunc func(Entry) error
+
+type hook struct {
+	fn HookFunc
+}
+
+func hookFor(fn HookFunc) *hook {
+	return &hook{fn}
+}
+
+func (h *hook) Fire(e Entry) error {
+	return h.fn(e)
+}
+
+//
+type Hooks interface {
+	AddHook(Timing, Level, ...Hook)
+	Fire(Timing, Level, Entry) error
+}
+
+type Timing int
+
+const (
+	PRE Timing = iota
+	POST
+)
+
+type hooks struct {
+	has map[Timing]map[Level][]Hook
+}
+
+func newHooks() *hooks {
+	has := make(map[Timing]map[Level][]Hook)
+	has[PRE] = make(map[Level][]Hook)
+	has[POST] = make(map[Level][]Hook)
+	h := &hooks{has}
+	h.AddHook(POST, LFatal, hookFor(func(Entry) error { os.Exit(1); return nil }))
+	h.AddHook(POST, LPanic, hookFor(func(Entry) error { panic("panic hook"); return nil }))
+	return h
+}
+
+//
+func (h *hooks) AddHook(t Timing, l Level, hk ...Hook) {
+	m := h.has[t]
+	m[l] = append(m[l], hk...)
+	h.has[t] = m
+}
+
+//
+func (h *hooks) Fire(at Timing, lv Level, e Entry) error {
+	m := h.has[at]
+	if l, ok := m[lv]; ok {
+		for _, hook := range l {
+			if err := hook.Fire(e); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+//
 type Entry interface {
 	Logger
 	Fielder
@@ -190,10 +307,12 @@ type Entry interface {
 	EntryLevel() Level
 }
 
+//
 type Fielder interface {
 	Fields() []Field
 }
 
+//
 type Field struct {
 	Order int
 	Key   string
@@ -216,20 +335,25 @@ func mkFormatFields(format string, v ...interface{}) []Field {
 	return ret
 }
 
+//
 type FieldsSort []Field
 
+//
 func (f FieldsSort) Len() int {
 	return len(f)
 }
 
+//
 func (f FieldsSort) Less(i, j int) bool {
 	return f[i].Order < f[j].Order
 }
 
+//
 func (f FieldsSort) Swap(i, j int) {
 	f[i], f[j] = f[j], f[i]
 }
 
+//
 type Reader interface {
 	Read() (*bytes.Buffer, error)
 }
@@ -242,28 +366,32 @@ type entry struct {
 	fields []Field
 }
 
-func newEntry(l Logger, f ...Field) Entry {
+func newEntry(l Logger, lv Level, f ...Field) *entry {
 	return &entry{
 		created: time.Now(),
-		level:   LUnrecognized,
+		level:   lv,
 		Logger:  l,
 		fields:  f,
 	}
 }
 
+//
 func (e *entry) Read() (*bytes.Buffer, error) {
 	s, err := e.Format(e)
 	return bytes.NewBuffer(s), err
 }
 
+//
 func (e *entry) Fields() []Field {
 	return e.fields
 }
 
+//
 func (e *entry) SetEntryLevel(l Level) {
 	e.level = l
 }
 
+//
 func (e *entry) EntryLevel() Level {
 	if e.level != LUnrecognized {
 		return e.level
@@ -271,21 +399,25 @@ func (e *entry) EntryLevel() Level {
 	return e.Level()
 }
 
+//
 func (e *entry) Created() time.Time {
 	return e.created
 }
 
+//
 type Level int
 
 const (
-	LUnrecognized Level = iota
-	LPanic
-	LFatal
-	LError
-	LWarn
-	LInfo
-	LDebug
+	LUnrecognized Level = iota //
+	LPanic                     //
+	LFatal                     //
+	LError                     //
+	LWarn                      //
+	LInfo                      //
+	LDebug                     //
 )
+
+var Levels []Level = []Level{LPanic, LFatal, LError, LWarn, LInfo, LDebug}
 
 var stringToLevel = map[string]Level{
 	"panic": LPanic,
@@ -296,6 +428,7 @@ var stringToLevel = map[string]Level{
 	"debug": LDebug,
 }
 
+//
 func StringToLevel(lv string) Level {
 	if level, ok := stringToLevel[strings.ToLower(lv)]; ok {
 		return level
@@ -303,6 +436,7 @@ func StringToLevel(lv string) Level {
 	return LUnrecognized
 }
 
+//
 func (l Level) String() string {
 	switch l {
 	case LPanic:
@@ -321,6 +455,7 @@ func (l Level) String() string {
 	return "unrecognized"
 }
 
+//
 func (lv Level) Color() func(io.Writer, ...interface{}) {
 	switch lv {
 	case LPanic:
@@ -339,27 +474,26 @@ func (lv Level) Color() func(io.Writer, ...interface{}) {
 	return white
 }
 
+//
 type Formatter interface {
 	Format(Entry) ([]byte, error)
 }
 
-type FormatterSwapper interface {
-	SwapFormatter(Formatter)
+//
+type FormatterManager interface {
+	SetFormatter(string, Formatter)
+	GetFormatter(string) Formatter
+	SwapFormatter(string)
 }
 
 type formatters map[string]Formatter
 
-var hasFormatters formatters
-
-func SetFormatter(k string, f Formatter) {
-	hasFormatters[k] = f
-}
-
-func GetFormatter(k string) Formatter {
-	if f, ok := hasFormatters[k]; ok {
-		return f
+func defaultFormatters(tag string) formatters {
+	return formatters{
+		"null": DefaultNullFormatter(),
+		"raw":  DefaultRawFormatter(),
+		"text": MakeTextFormatter(tag),
 	}
-	return &NullFormatter{}
 }
 
 type NullFormatter struct{}
@@ -386,10 +520,14 @@ func (r *RawFormatter) Format(e Entry) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// A text formatter NOTE:a bit of overengineering involving text.template where
-// string+" " or fmt.Sprintf would work, but this provides multiple templating
-// options to work with in formatting as opposed to appending or formatting by
-// package fmt. If simplicity is your thing, rewrite this.
+// A text formatter
+//
+// Uses the package color functions (linux only) and involves a bit of
+// overengineering with text.template where string+" " or fmt.Sprintf would
+// work(this provides multiple templating options to work with in formatting as
+// opposed to appending or formatting by package fmt).
+//
+// If minimalism is your thing, rewrite this.
 type TextFormatter struct {
 	Name            string
 	TimestampFormat string
@@ -508,27 +646,29 @@ func format(b *bytes.Buffer, fds FieldsSort) {
 	}
 }
 
-type color struct {
-	params []Attribute
-}
-
-// Should work in most terminals.
-// See github.com/mattn/go-colorable for tweaking tips by os.
+//
 func Color(value ...Attribute) func(io.Writer, ...interface{}) {
 	c := &color{params: make([]Attribute, 0)}
 	c.Add(value...)
 	return c.Fprint
 }
 
+type color struct {
+	params []Attribute
+}
+
+//
 func (c *color) Add(value ...Attribute) *color {
 	c.params = append(c.params, value...)
 	return c
 }
 
+//
 func (c *color) Fprint(w io.Writer, a ...interface{}) {
 	c.wrap(w, a...)
 }
 
+//
 func (c *color) Fprintf(w io.Writer, f string, a ...interface{}) {
 	c.wrap(w, fmt.Sprintf(f, a...))
 }
@@ -545,6 +685,7 @@ func (c *color) sequence() string {
 func (c *color) wrap(w io.Writer, a ...interface{}) {
 	if c.noColor() {
 		fmt.Fprint(w, a...)
+		return
 	}
 
 	c.format(w)
@@ -560,18 +701,7 @@ func (c *color) unformat(w io.Writer) {
 	fmt.Fprintf(w, "%s[%dm", escape, Reset)
 }
 
-var NoColor = !IsTerminal(os.Stdout.Fd())
-
-const ioctlReadTermios = syscall.TCGETS
-
-// IsTerminal return true if the file descriptor is terminal.
-// see github.com/mattn/go-isatty
-// You WILL want to change this if you are using an os other than a Linux variant.
-func IsTerminal(fd uintptr) bool {
-	var termios syscall.Termios
-	_, _, err := syscall.Syscall6(syscall.SYS_IOCTL, fd, ioctlReadTermios, uintptr(unsafe.Pointer(&termios)), 0, 0, 0)
-	return err == 0
-}
+var NoColor = !isatty.IsTerminal(os.Stdout.Fd())
 
 func (c *color) noColor() bool {
 	return NoColor
@@ -579,6 +709,7 @@ func (c *color) noColor() bool {
 
 const escape = "\x1b"
 
+//
 type Attribute int
 
 const (
@@ -649,40 +780,6 @@ var (
 	white   = Color(FgHiWhite)
 )
 
-type Hook interface {
-	On() []Level
-	Fire(Entry) error
-}
-
-type Hooks interface {
-	AddHook(Hook)
-	Fire(Level, Entry) error
-}
-
-type hooks struct {
-	has map[Level][]Hook
-}
-
-func (h *hooks) AddHook(hk Hook) {
-	for _, lv := range hk.On() {
-		h.has[lv] = append(h.has[lv], hk)
-	}
-}
-
-func (h *hooks) Fire(lv Level, e Entry) error {
-	for _, hook := range h.has[lv] {
-		if err := hook.Fire(e); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-var Current Logger
-
 func init() {
-	hasFormatters = make(formatters)
-	SetFormatter("null", DefaultNullFormatter())
-	SetFormatter("raw", DefaultRawFormatter())
 	initializeTemplates()
 }
